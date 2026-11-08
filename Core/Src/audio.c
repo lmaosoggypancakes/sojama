@@ -52,20 +52,15 @@ void Audio_MeterAdd(Audio_Meter *m, int32_t sample)
 
 int32_t Audio_ClipNext(Audio_Clip *c)
 {
+  uint32_t next_pos = (c->pos + 1U == c->len) ? 0U : c->pos + 1U;
   int32_t cur = c->data[c->pos];
-  int32_t out;
+  int32_t next = c->data[next_pos];
+  int32_t out = (cur + ((next - cur) * (int32_t)c->phase) / (int32_t)c->ratio) * 256;
 
-  if (c->half == 0U)
+  if (++c->phase == c->ratio)
   {
-    out = cur * 256;
-    c->half = 1U;
-  }
-  else
-  {
-    uint32_t next_pos = (c->pos + 1U == c->len) ? 0U : c->pos + 1U;
-    out = ((cur + c->data[next_pos]) / 2) * 256;
+    c->phase = 0U;
     c->pos = next_pos;
-    c->half = 0U;
   }
   return out;
 }
@@ -73,7 +68,8 @@ int32_t Audio_ClipNext(Audio_Clip *c)
 void Audio_RecStart(Audio_Recorder *r)
 {
   r->len = 0;
-  r->odd = 0;
+  r->acc = 0;
+  r->n = 0;
 }
 
 uint8_t Audio_RecAdd(Audio_Recorder *r, int32_t sample)
@@ -82,14 +78,14 @@ uint8_t Audio_RecAdd(Audio_Recorder *r, int32_t sample)
   {
     return 1;
   }
-  if (r->odd == 0U)
+  r->acc += sample;
+  if (++r->n < r->ratio)
   {
-    r->pending = sample;
-    r->odd = 1U;
     return 0;
   }
-  r->odd = 0U;
-  r->buf[r->len++] = (int16_t)(((r->pending + sample) / 2) / 256);
+  r->buf[r->len++] = (int16_t)((r->acc / (int32_t)r->ratio) / 256);
+  r->acc = 0;
+  r->n = 0;
   return (r->len >= r->cap) ? 1U : 0U;
 }
 

@@ -27,19 +27,21 @@ typedef struct
 
 typedef struct
 {
-  const int16_t *data;  /* 16-bit clip at half the output rate */
+  const int16_t *data;  /* 16-bit clip at 1/ratio of the output rate */
   uint32_t len;
   uint32_t pos;
-  uint8_t  half;        /* 0 = output the sample, 1 = output the midpoint to the next */
+  uint8_t  phase;       /* output frames already produced from data[pos], 0..ratio-1 */
+  uint8_t  ratio;       /* output frames per clip sample */
 } Audio_Clip;
 
 typedef struct
 {
-  int16_t *buf;         /* recording at half the input rate */
+  int16_t *buf;         /* recording at 1/ratio of the input rate */
   uint32_t cap;         /* buffer size in samples */
   uint32_t len;         /* samples recorded so far */
-  int32_t  pending;     /* first sample of the current pair */
-  uint8_t  odd;         /* 1 when holding the first sample of a pair */
+  int32_t  acc;         /* sum of the current group of input samples */
+  uint8_t  n;           /* input samples in the current group */
+  uint8_t  ratio;       /* input samples averaged into each stored sample */
 } Audio_Recorder;
 
 typedef struct
@@ -60,14 +62,14 @@ uint32_t Audio_ToSai24(int32_t sample);
 
 void Audio_MeterAdd(Audio_Meter *m, int32_t sample);
 
-/* Next 24-bit output sample of the clip, doubling its rate by linear interpolation.
- * Loops back to the start at the end. */
+/* Next 24-bit output sample of the clip, raising its rate by c->ratio with linear
+ * interpolation. Loops back to the start at the end. */
 int32_t Audio_ClipNext(Audio_Clip *c);
 
 void Audio_RecStart(Audio_Recorder *r);
 
-/* Add one 24-bit sample at the full rate. Pairs are averaged into one 16-bit sample.
- * Returns 1 once the buffer is full. */
+/* Add one 24-bit sample at the full rate. Each group of r->ratio samples is averaged
+ * into one 16-bit sample. Returns 1 once the buffer is full. */
 uint8_t Audio_RecAdd(Audio_Recorder *r, int32_t sample);
 
 /* Call once per frame with the raw pin state (1 = pressed).

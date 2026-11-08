@@ -67,27 +67,42 @@ static const ADAU1372_ConfigTypeDef codec_cfg = {
 
 
 /* What plays when not recording or playing back, changeable from the debugger:
- * 0 = song clip, 1 = mic passthrough, 2 = silence. */
+ * 0 = song clip, 1 = mic passthrough (mic 1 left, mic 2 right), 2 = silence. */
 volatile uint8_t audio_mode = 2;
-/* Mic level on input 0, updated every 100 ms. Watch mic_meter.peak_pct while talking. */
-volatile Audio_Meter mic_meter;
+/* Mic levels, updated every 100 ms: [0] = AIN0 (TDM slot 0), [1] = AIN1 (slot 1).
+ * Watch mic_meter[n].peak_pct while talking. */
+volatile Audio_Meter mic_meter[2];
 volatile uint32_t audio_frames;
-static Audio_Clip clip = { audio_clip, AUDIO_CLIP_LEN, 0, 0 };
+/* Times the SAI blocks were restarted to put the receive slots back in order. */
+volatile uint32_t audio_resyncs;
+static Audio_Clip clip = { audio_clip, AUDIO_CLIP_LEN, 0, 0, 2 };
 
-/* Record / play back. Record: B1 user button (PC13, high when pressed).
- * Play: button from PD0 to GND (internal pull-up). Red LD3 (PG2) flashes while
- * recording, green LD1 (PC7) is on during playback. */
+/* Record / play back both mics. Record: button from PC8 to GND, or the B1 user button
+ * (PC13, high when pressed). Play: button from PC9 to GND. PC8/PC9 use internal pull-ups. Red LD3 (PG2) flashes while
+ * recording, green LD1 (PC7) is on during playback. Stored at 16 kHz (1/3 of 48 kHz)
+ * so 10 s of both mics fits in RAM. */
 #define REC_SECONDS     10U
-#define REC_RATE        24000U
-#define REC_LEN         (REC_SECONDS * REC_RATE)
-#define PLAY_BTN_PORT   GPIOD
-#define PLAY_BTN_PIN    GPIO_PIN_0
+#define REC_RATIO       3U
+#define REC_LEN         (REC_SECONDS * 48000U / REC_RATIO)
+#define REC_BTN_PORT    GPIOC
+#define REC_BTN_PIN     GPIO_PIN_8
+#define PLAY_BTN_PORT   GPIOC
+#define PLAY_BTN_PIN    GPIO_PIN_9
 #define LED_FLASH_FRAMES 6000U   /* 125 ms at 48 kHz */
 typedef enum { APP_IDLE, APP_RECORDING, APP_PLAYING } App_State;
 volatile App_State app_state = APP_IDLE;
-static int16_t rec_buf[REC_LEN];
-static Audio_Recorder recorder = { rec_buf, REC_LEN, 0, 0, 0 };
-static Audio_Clip rec_clip;
+static int16_t rec_buf[2][REC_LEN];
+static Audio_Recorder recorder[2] = {
+  { rec_buf[0], REC_LEN, 0, 0, 0, REC_RATIO },
+  { rec_buf[1], REC_LEN, 0, 0, 0, REC_RATIO },
+};
+static Audio_Clip rec_clip[2];
+/* Normal recording (0): mic 1 -> speaker 1 (left, HPOUTL), mic 2 -> speaker 2
+ * (right, HPOUTR), 10 s each. Test mode (1): one track, mic 1 for the first half and
+ * mic 2 for the second, played on both speakers; red LD3 flashes during the mic 1
+ * half, blue LD2 (PB7) during the mic 2 half. */
+volatile uint8_t rec_split_test = 0;
+#define REC_SPLIT_FRAMES (REC_SECONDS * 48000U / 2U)
 static Audio_Button rec_button, play_button;
 /* USER CODE END PV */
 
@@ -208,6 +223,29 @@ __attribute__((unused)) static void I2C_ConnectionTest(void)
   }
 }
 
+/* Restart SAI1 so the next received word is TDM slot 0 again. Both blocks stop at the
+ * end of the current frame, their FIFOs are emptied, then the synchronous slave (B)
+ * is enabled before the master (A). */
+static void Audio_Resync(void)
+{
+  __HAL_SAI_DISABLE(&hsai_BlockB1);
+  __HAL_SAI_DISABLE(&hsai_BlockA1);
+  uint32_t start = HAL_GetTick();
+  while (((SAI1_Block_A->CR1 | SAI1_Block_B->CR1) & SAI_xCR1_SAIEN) && (HAL_GetTick() - start < 2U))
+  {
+  }
+  SAI1_Block_A->CR2 |= SAI_xCR2_FFLUSH;
+  SAI1_Block_B->CR2 |= SAI_xCR2_FFLUSH;
+  __HAL_SAI_CLEAR_FLAG(&hsai_BlockA1, SAI_FLAG_OVRUDR);
+  __HAL_SAI_CLEAR_FLAG(&hsai_BlockB1, SAI_FLAG_OVRUDR);
+  for (uint32_t i = 0; i < 4; i++)
+  {
+    SAI1_Block_B->DR = 0;
+  }
+  __HAL_SAI_ENABLE(&hsai_BlockB1);
+  __HAL_SAI_ENABLE(&hsai_BlockA1);
+  audio_resyncs++;
+}
 /* USER CODE END 0 */
 
 /**
@@ -272,36 +310,25 @@ int main(void)
   }
 
 
-  /* Start full-duplex audio. Block A (receive, slot 0 only) is already running to
-   * supply MCLK, so drop whatever piled up in its FIFO during init. */
-  while ((SAI1_Block_A->SR & SAI_xSR_FLVL) != SAI_FIFOSTATUS_EMPTY)
-  {
-    (void)SAI1_Block_A->DR;
-  }
-  __HAL_SAI_CLEAR_FLAG(&hsai_BlockA1, SAI_FLAG_OVRUDR);
-  /* Block B (transmit, slots 0 and 1) starts on Block A's next frame sync. */
-  for (uint32_t i = 0; i < 4; i++)
-  {
-    SAI1_Block_B->DR = 0;
-  }
-  __HAL_SAI_ENABLE(&hsai_BlockB1);
+  /* Start full-duplex audio: Block A receives slots 0 and 1, Block B sends slots 0 and 1. */
+  Audio_Resync();
   uint8_t last_vol = 0xFF;
   uint32_t play_left = 0;
   uint32_t led_count = 0;
+  uint32_t rec_frames = 0;
 
   /* Buttons and LEDs. */
   {
     GPIO_InitTypeDef gpio = {0};
     __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_GPIOD_CLK_ENABLE();
     __HAL_RCC_GPIOG_CLK_ENABLE();
     gpio.Mode = GPIO_MODE_INPUT;
     gpio.Pull = GPIO_NOPULL;
     gpio.Pin = GPIO_PIN_13;
     HAL_GPIO_Init(GPIOC, &gpio);
     gpio.Pull = GPIO_PULLUP;
-    gpio.Pin = PLAY_BTN_PIN;
-    HAL_GPIO_Init(PLAY_BTN_PORT, &gpio);
+    gpio.Pin = REC_BTN_PIN | PLAY_BTN_PIN;
+    HAL_GPIO_Init(GPIOC, &gpio);
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
     gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
@@ -309,8 +336,11 @@ int main(void)
     HAL_GPIO_Init(GPIOG, &gpio);
     gpio.Pin = GPIO_PIN_7;
     HAL_GPIO_Init(GPIOC, &gpio);
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    HAL_GPIO_Init(GPIOB, &gpio);
     HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
   }
 
   /* USER CODE END 2 */
@@ -333,46 +363,92 @@ int main(void)
       ADAU1372_SetDacVolume(&codec, 1, vol);
     }
 
-    if (Audio_ButtonPressed(&rec_button, HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET))
+    /* A stall long enough to overflow the receive FIFO can leave the slots out of
+     * order, so restart the SAI whenever that happens (including after the I2C above). */
+    if (SAI1_Block_A->SR & SAI_xSR_OVRUDR)
     {
-      Audio_RecStart(&recorder);
+      Audio_Resync();
+    }
+
+    uint8_t rec_raw = (HAL_GPIO_ReadPin(REC_BTN_PORT, REC_BTN_PIN) == GPIO_PIN_RESET)
+                      || (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET);
+    if (Audio_ButtonPressed(&rec_button, rec_raw))
+    {
+      Audio_RecStart(&recorder[0]);
+      Audio_RecStart(&recorder[1]);
       app_state = APP_RECORDING;
       led_count = 0;
+      rec_frames = 0;
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
     }
     if (Audio_ButtonPressed(&play_button, HAL_GPIO_ReadPin(PLAY_BTN_PORT, PLAY_BTN_PIN) == GPIO_PIN_RESET)
-        && app_state != APP_RECORDING && recorder.len > 0)
+        && app_state != APP_RECORDING && recorder[0].len > 0)
     {
-      rec_clip = (Audio_Clip){ rec_buf, recorder.len, 0, 0 };
-      play_left = recorder.len * 2U;
+      for (uint32_t ch = 0; ch < 2; ch++)
+      {
+        /* In the split test both outputs play the single track in rec_buf[0]. */
+        uint32_t src = rec_split_test ? 0U : ch;
+        rec_clip[ch] = (Audio_Clip){ rec_buf[src], recorder[src].len, 0, 0, REC_RATIO };
+      }
+      play_left = recorder[0].len * REC_RATIO;
       app_state = APP_PLAYING;
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
     }
 
-    /* One mic sample arrives per 48 kHz frame; waiting for it paces the loop. */
-    while ((SAI1_Block_A->SR & SAI_xSR_FLVL) == SAI_FIFOSTATUS_EMPTY)
+    /* Two mic samples arrive per 48 kHz frame (slot 0, slot 1); waiting for them paces the loop. */
+    int32_t mic[2];
+    for (uint32_t ch = 0; ch < 2; ch++)
     {
+      while ((SAI1_Block_A->SR & SAI_xSR_FLVL) == SAI_FIFOSTATUS_EMPTY)
+      {
+      }
+      mic[ch] = Audio_FromSai24(SAI1_Block_A->DR);
+      Audio_MeterAdd((Audio_Meter *)&mic_meter[ch], mic[ch]);
     }
-    int32_t mic = Audio_FromSai24(SAI1_Block_A->DR);
-    Audio_MeterAdd((Audio_Meter *)&mic_meter, mic);
 
-    int32_t out = 0;
+    int32_t out[2] = { 0, 0 };
     if (app_state == APP_RECORDING)
     {
+      uint8_t second_half = (rec_split_test && rec_frames >= REC_SPLIT_FRAMES) ? 1U : 0U;
+      if (rec_frames == REC_SPLIT_FRAMES && rec_split_test)
+      {
+        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
+        led_count = 0;
+      }
+      rec_frames++;
       if (++led_count == LED_FLASH_FRAMES)
       {
         led_count = 0;
-        HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_2);
+        if (second_half)
+        {
+          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
+        }
+        else
+        {
+          HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_2);
+        }
       }
-      if (Audio_RecAdd(&recorder, mic))
+      uint8_t full;
+      if (rec_split_test)
+      {
+        full = Audio_RecAdd(&recorder[0], second_half ? mic[1] : mic[0]);
+      }
+      else
+      {
+        full = Audio_RecAdd(&recorder[0], mic[0]);
+        full |= Audio_RecAdd(&recorder[1], mic[1]);
+      }
+      if (full)
       {
         app_state = APP_IDLE;
         HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
       }
     }
     else if (app_state == APP_PLAYING)
     {
-      out = Audio_ClipNext(&rec_clip);
+      out[0] = Audio_ClipNext(&rec_clip[0]);
+      out[1] = Audio_ClipNext(&rec_clip[1]);
       if (--play_left == 0U)
       {
         app_state = APP_IDLE;
@@ -381,20 +457,21 @@ int main(void)
     }
     else if (audio_mode == 0)
     {
-      out = Audio_ClipNext(&clip);
+      out[0] = Audio_ClipNext(&clip);
+      out[1] = out[0];
     }
     else if (audio_mode == 1)
     {
-      out = mic;
+      out[0] = mic[0];
+      out[1] = mic[1];
     }
-    uint32_t word = Audio_ToSai24(out);
 
     /* Two words per frame (left, right); wait until the FIFO has room for both. */
     while ((SAI1_Block_B->SR & SAI_xSR_FLVL) >= SAI_FIFOSTATUS_3QUARTERFULL)
     {
     }
-    SAI1_Block_B->DR = word;
-    SAI1_Block_B->DR = word;
+    SAI1_Block_B->DR = Audio_ToSai24(out[0]);
+    SAI1_Block_B->DR = Audio_ToSai24(out[1]);
     audio_frames++;
   }
   /* USER CODE END 3 */
@@ -616,7 +693,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.SlotInit.FirstBitOffset = 0;
   hsai_BlockA1.SlotInit.SlotSize = SAI_SLOTSIZE_32B;
   hsai_BlockA1.SlotInit.SlotNumber = 4;
-  hsai_BlockA1.SlotInit.SlotActive = 0x00000001;
+  hsai_BlockA1.SlotInit.SlotActive = 0x00000003;
   if (HAL_SAI_Init(&hsai_BlockA1) != HAL_OK)
   {
     Error_Handler();
