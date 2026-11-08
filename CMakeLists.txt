@@ -48,6 +48,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/adau1372.c
     Core/Src/audio_clip.c
     Core/Src/audio.c
+    Core/Src/uart_comm.c
+    # UART HAL driver (USART1 is set up in uart_comm.c, not in CubeMX)
+    Drivers/STM32U5xx_HAL_Driver/Src/stm32u5xx_hal_uart.c
+    Drivers/STM32U5xx_HAL_Driver/Src/stm32u5xx_hal_uart_ex.c
 )
 
 # Add include paths
@@ -58,6 +62,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+    HAL_UART_MODULE_ENABLED
 )
 
 # Remove wrong libob.a library dependency when using cpp files

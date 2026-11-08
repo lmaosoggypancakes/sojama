@@ -76,4 +76,47 @@ uint8_t Audio_RecAdd(Audio_Recorder *r, int32_t sample);
  * Returns 1 on the frame a debounced press starts. */
 uint8_t Audio_ButtonPressed(Audio_Button *b, uint8_t pressed);
 
+/* ---- Tone generator: sine at any frequency (phase accumulator + table) ---- */
+typedef struct
+{
+  uint32_t phase;   /* 0..2^32 is one cycle */
+  uint32_t inc;     /* phase step per sample */
+  float    amp;     /* peak amplitude in 24-bit units */
+} Audio_Tone;
+
+/* hz = tone frequency, fs = sample rate, level = peak amplitude as a fraction of
+ * full scale (0..1). */
+void Audio_ToneSet(Audio_Tone *t, float hz, float fs, float level);
+
+/* Next 24-bit sample of the tone. */
+int32_t Audio_ToneNext(Audio_Tone *t);
+
+/* ---- Spectrum: 512-point FFT with a Hann window, split into small steps ----
+ * Each Audio_SpectrumStep() call does a bounded amount of work (a few us on the
+ * STM32) so it can run once per audio frame without missing samples. */
+#define SPEC_N     512U
+#define SPEC_BINS  (SPEC_N / 2U)   /* bin k is k * fs / SPEC_N Hz */
+#define SPEC_FLOOR 140U            /* db[] values are clamped to -140 dBFS */
+
+typedef struct
+{
+  float    re[SPEC_N];
+  float    im[SPEC_N];
+  uint8_t  db[SPEC_BINS];  /* result: level of each bin in -dBFS (0 = full-scale sine) */
+  uint32_t pos;            /* samples collected, butterflies done in the stage, or bins done */
+  uint32_t size;           /* current FFT stage size, 2..SPEC_N */
+  uint8_t  phase;          /* 0 = collecting, 1 = FFT, 2 = magnitudes, 3 = done */
+} Audio_Spectrum;
+
+/* Build the window, bit-reversal and twiddle tables. Call once before use. */
+void Audio_SpectrumInit(void);
+
+void Audio_SpectrumStart(Audio_Spectrum *s);
+
+/* Add one 24-bit sample. Returns 1 once SPEC_N samples have been collected. */
+uint8_t Audio_SpectrumAdd(Audio_Spectrum *s, int32_t sample);
+
+/* Do the next slice of work. Returns 1 when s->db[] holds the finished spectrum. */
+uint8_t Audio_SpectrumStep(Audio_Spectrum *s);
+
 #endif /* AUDIO_H */

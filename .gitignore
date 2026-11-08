@@ -1,3 +1,11 @@
 build
 mx.scratch
 !.settings
+
+# Python: virtual environment and caches (the scripts in Tests/ are still tracked)
+.venv/
+__pycache__/
+*.pyc
+
+# Host unit test binary (built from Tests/audio_test.c)
+/audio_test

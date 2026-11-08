@@ -24,6 +24,8 @@
 #include "adau1372.h"
 #include "audio_clip.h"
 #include "audio.h"
+#include "uart_comm.h"
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -67,14 +69,48 @@ static const ADAU1372_ConfigTypeDef codec_cfg = {
 
 
 /* What plays when not recording or playing back, changeable from the debugger:
- * 0 = song clip, 1 = mic passthrough (mic 1 left, mic 2 right), 2 = silence. */
-volatile uint8_t audio_mode = 2;
+ * 0 = song clip, 1 = mic passthrough (mic 1 left, mic 2 right), 2 = silence,
+ * 3 = test tone on both speakers (TONE_HZ at TONE_LEVEL). */
+volatile uint8_t audio_mode = 3;
+#define TONE_HZ    1000.0f
+#define TONE_LEVEL 0.25f     /* peak, fraction of full scale: -12 dBFS */
+static Audio_Tone tone;
 /* Mic levels, updated every 100 ms: [0] = AIN0 (TDM slot 0), [1] = AIN1 (slot 1).
  * Watch mic_meter[n].peak_pct while talking. */
 volatile Audio_Meter mic_meter[2];
 volatile uint32_t audio_frames;
 /* Times the SAI blocks were restarted to put the receive slots back in order. */
 volatile uint32_t audio_resyncs;
+/* Audio loop timing, from the DWT cycle counter (160 cycles = 1 us). One frame is
+ * 3333 cycles; work beyond that is absorbed by the SAI FIFOs for a few frames only.
+ * audio_work_max_cycles: most work done in one frame, excluding waits for the SAI.
+ * audio_late_frames: frames whose work took longer than a frame.
+ * audio_tx_underruns: times the speaker FIFO ran empty (each one is a click).
+ * Write 0 to any of them in Live Watch to restart the measurement. */
+#define FRAME_CYCLES 3333U
+volatile uint32_t audio_work_max_cycles;
+volatile uint32_t audio_late_frames;
+volatile uint32_t audio_tx_underruns;
+/* Data streamed to the PC over UART, changeable from the debugger. Either stream
+ * turns off the UART test counter.
+ * 1 = mic levels (Tests/mic_plot.py): every 50 ms "MIC,<peak1>,<peak2>\r\n", each peak
+ *     the largest |sample - dc| of that mic in the period, 0..8388608 (full scale).
+ * 2 = spectrum (Tests/fft_plot.py): "FFT,<mic 0|1>,<v0>,...,<v255>\r\n", bin k at
+ *     k * 93.75 Hz, each value the bin level in -dBFS (0..140). Alternates mics. */
+volatile uint8_t stream_mode = 0;
+#define MIC_STREAM_FRAMES 2400U   /* 50 ms at 48 kHz */
+static uint32_t stream_peak[2];
+static uint32_t stream_frames;
+
+/* Spectrum stream state. The FFT and the text formatting run a slice per frame. */
+typedef enum { SPEC_COLLECT, SPEC_PROCESS, SPEC_FORMAT, SPEC_SEND } Spec_Stage;
+#define SPEC_FORMAT_PER_FRAME 8U
+static Audio_Spectrum spectrum;
+static Spec_Stage spec_stage;
+static uint8_t spec_ch;
+static uint8_t spec_line[UART_TX_BUF_SIZE];
+static size_t spec_len;
+static uint32_t spec_bin;
 static Audio_Clip clip = { audio_clip, AUDIO_CLIP_LEN, 0, 0, 2 };
 
 /* Record / play back both mics. Record: button from PC8 to GND, or the B1 user button
@@ -310,6 +346,21 @@ int main(void)
   }
 
 
+  /* UART to the PC (ST-LINK virtual COM port). Audio still runs if this fails. */
+  uart_comm_init();
+  if (stream_mode != 0)
+  {
+    uart_test_periodic = 0;
+  }
+  Audio_SpectrumInit();
+  Audio_ToneSet(&tone, TONE_HZ, 48000.0f, TONE_LEVEL);
+  Audio_SpectrumStart(&spectrum);
+
+  /* Cycle counter for the audio loop timing measurements. */
+  DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
   /* Start full-duplex audio: Block A receives slots 0 and 1, Block B sends slots 0 and 1. */
   Audio_Resync();
   uint8_t last_vol = 0xFF;
@@ -352,6 +403,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint32_t t_top = DWT->CYCCNT;
+    uint32_t t_wait = 0;          /* cycles spent waiting on the SAI, not working */
+    uart_comm_poll();
+
     /* DAC volume: -12 dB for mic passthrough to keep feedback down, 0 dB otherwise.
      * Each step above 0x00 is 0.375 dB quieter. Changing it takes ~1 ms of I2C,
      * so it only happens when the setting changes. */
@@ -399,11 +454,19 @@ int main(void)
     int32_t mic[2];
     for (uint32_t ch = 0; ch < 2; ch++)
     {
+      uint32_t t0 = DWT->CYCCNT;
       while ((SAI1_Block_A->SR & SAI_xSR_FLVL) == SAI_FIFOSTATUS_EMPTY)
       {
       }
+      t_wait += DWT->CYCCNT - t0;
       mic[ch] = Audio_FromSai24(SAI1_Block_A->DR);
       Audio_MeterAdd((Audio_Meter *)&mic_meter[ch], mic[ch]);
+      int32_t dev = mic[ch] - mic_meter[ch].dc;
+      uint32_t mag = (dev < 0) ? (uint32_t)(-(int64_t)dev) : (uint32_t)dev;
+      if (mag > stream_peak[ch])
+      {
+        stream_peak[ch] = mag;
+      }
     }
 
     int32_t out[2] = { 0, 0 };
@@ -465,14 +528,99 @@ int main(void)
       out[0] = mic[0];
       out[1] = mic[1];
     }
+    else if (audio_mode == 3)
+    {
+      out[0] = Audio_ToneNext(&tone);
+      out[1] = out[0];
+    }
 
     /* Two words per frame (left, right); wait until the FIFO has room for both. */
+    uint32_t t1 = DWT->CYCCNT;
     while ((SAI1_Block_B->SR & SAI_xSR_FLVL) >= SAI_FIFOSTATUS_3QUARTERFULL)
     {
     }
+    t_wait += DWT->CYCCNT - t1;
     SAI1_Block_B->DR = Audio_ToSai24(out[0]);
     SAI1_Block_B->DR = Audio_ToSai24(out[1]);
+    if (SAI1_Block_B->SR & SAI_xSR_OVRUDR)
+    {
+      audio_tx_underruns++;
+      __HAL_SAI_CLEAR_FLAG(&hsai_BlockB1, SAI_FLAG_OVRUDR);
+    }
     audio_frames++;
+
+    if (stream_mode == 1 && ++stream_frames >= MIC_STREAM_FRAMES)
+    {
+      /* If UART is still busy this report is skipped, never waited for. */
+      uint8_t msg[32];
+      size_t n = 4;
+      memcpy(msg, "MIC,", 4);
+      n += uart_format_uint(&msg[n], stream_peak[0]);
+      msg[n++] = ',';
+      n += uart_format_uint(&msg[n], stream_peak[1]);
+      msg[n++] = '\r';
+      msg[n++] = '\n';
+      uart_send(msg, n);
+      stream_peak[0] = 0;
+      stream_peak[1] = 0;
+      stream_frames = 0;
+    }
+
+    if (stream_mode == 2)
+    {
+      /* One stage step per frame keeps each frame's extra work to a few microseconds. */
+      switch (spec_stage)
+      {
+        case SPEC_COLLECT:
+          if (Audio_SpectrumAdd(&spectrum, mic[spec_ch]))
+          {
+            spec_stage = SPEC_PROCESS;
+          }
+          break;
+        case SPEC_PROCESS:
+          if (Audio_SpectrumStep(&spectrum))
+          {
+            memcpy(spec_line, "FFT,", 4);
+            spec_len = 4;
+            spec_line[spec_len++] = (uint8_t)('0' + spec_ch);
+            spec_bin = 0;
+            spec_stage = SPEC_FORMAT;
+          }
+          break;
+        case SPEC_FORMAT:
+          for (uint32_t i = 0; i < SPEC_FORMAT_PER_FRAME && spec_bin < SPEC_BINS; i++, spec_bin++)
+          {
+            spec_line[spec_len++] = ',';
+            spec_len += uart_format_uint(&spec_line[spec_len], spectrum.db[spec_bin]);
+          }
+          if (spec_bin == SPEC_BINS)
+          {
+            spec_line[spec_len++] = '\r';
+            spec_line[spec_len++] = '\n';
+            spec_stage = SPEC_SEND;
+          }
+          break;
+        case SPEC_SEND:
+          /* Waits (without blocking) until the previous line has finished sending. */
+          if (!uart_tx_busy() && uart_send(spec_line, spec_len))
+          {
+            spec_ch ^= 1U;
+            Audio_SpectrumStart(&spectrum);
+            spec_stage = SPEC_COLLECT;
+          }
+          break;
+      }
+    }
+
+    uint32_t work = (DWT->CYCCNT - t_top) - t_wait;
+    if (work > audio_work_max_cycles)
+    {
+      audio_work_max_cycles = work;
+    }
+    if (work > FRAME_CYCLES)
+    {
+      audio_late_frames++;
+    }
   }
   /* USER CODE END 3 */
 }
