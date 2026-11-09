@@ -71,7 +71,7 @@ static const ADAU1372_ConfigTypeDef codec_cfg = {
 /* What plays when not recording or playing back, changeable from the debugger:
  * 0 = song clip, 1 = mic passthrough (mic 1 left, mic 2 right), 2 = silence,
  * 3 = test tone on both speakers (TONE_HZ at TONE_LEVEL). */
-volatile uint8_t audio_mode = 3;
+volatile uint8_t audio_mode = 2;
 #define TONE_HZ    1000.0f
 #define TONE_LEVEL 0.25f     /* peak, fraction of full scale: -12 dBFS */
 static Audio_Tone tone;
@@ -79,38 +79,46 @@ static Audio_Tone tone;
  * Watch mic_meter[n].peak_pct while talking. */
 volatile Audio_Meter mic_meter[2];
 volatile uint32_t audio_frames;
-/* Times the SAI blocks were restarted to put the receive slots back in order. */
-volatile uint32_t audio_resyncs;
-/* Audio loop timing, from the DWT cycle counter (160 cycles = 1 us). One frame is
- * 3333 cycles; work beyond that is absorbed by the SAI FIFOs for a few frames only.
- * audio_work_max_cycles: most work done in one frame, excluding waits for the SAI.
- * audio_late_frames: frames whose work took longer than a frame.
- * audio_tx_underruns: times the speaker FIFO ran empty (each one is a click).
- * Write 0 to any of them in Live Watch to restart the measurement. */
-#define FRAME_CYCLES 3333U
-volatile uint32_t audio_work_max_cycles;
-volatile uint32_t audio_late_frames;
+/* Audio runs on SAI1 DMA: each DMA half-buffer is AUDIO_BLOCK_FRAMES frames (1 ms),
+ * processed in the DMA interrupt by Audio_ProcessBlock(). Diagnostics:
+ * audio_blocks: blocks processed. audio_isr_max_cycles: longest block processing time
+ * (DWT cycles, 160 = 1 us; a block is 1 ms = 160000). audio_tx_underruns: times the
+ * speaker FIFO ran empty (each one is a click). audio_sai_errors: SAI/DMA errors. */
+#define AUDIO_BLOCK_FRAMES 48U
+#define AUDIO_BUF_WORDS    (2U * AUDIO_BLOCK_FRAMES * 2U)   /* 2 halves x frames x 2 slots */
+volatile uint32_t audio_blocks;
+volatile uint32_t audio_isr_max_cycles;
 volatile uint32_t audio_tx_underruns;
+volatile uint32_t audio_sai_errors;
+static uint32_t audio_rx_buf[AUDIO_BUF_WORDS];
+static uint32_t audio_tx_buf[AUDIO_BUF_WORDS];
+static DMA_HandleTypeDef hdma_sai1_a;
+static DMA_HandleTypeDef hdma_sai1_b;
+static DMA_NodeTypeDef dma_node_sai1_a;
+static DMA_NodeTypeDef dma_node_sai1_b;
+static DMA_QListTypeDef dma_queue_sai1_a;
+static DMA_QListTypeDef dma_queue_sai1_b;
 /* Data streamed to the PC over UART, changeable from the debugger. Either stream
  * turns off the UART test counter.
  * 1 = mic levels (Tests/mic_plot.py): every 50 ms "MIC,<peak1>,<peak2>\r\n", each peak
  *     the largest |sample - dc| of that mic in the period, 0..8388608 (full scale).
  * 2 = spectrum (Tests/fft_plot.py): "FFT,<mic 0|1>,<v0>,...,<v255>\r\n", bin k at
  *     k * 93.75 Hz, each value the bin level in -dBFS (0..140). Alternates mics. */
-volatile uint8_t stream_mode = 0;
+volatile uint8_t stream_mode = 2;
 #define MIC_STREAM_FRAMES 2400U   /* 50 ms at 48 kHz */
+/* Written by the audio interrupt, sent by the main loop. */
 static uint32_t stream_peak[2];
 static uint32_t stream_frames;
+static uint32_t mic_report[2];
+static volatile uint8_t mic_report_ready;
 
-/* Spectrum stream state. The FFT and the text formatting run a slice per frame. */
-typedef enum { SPEC_COLLECT, SPEC_PROCESS, SPEC_FORMAT, SPEC_SEND } Spec_Stage;
-#define SPEC_FORMAT_PER_FRAME 8U
+/* Spectrum stream: the audio interrupt collects SPEC_N samples of mic spec_ch while
+ * spec_collecting is set; the main loop then runs the FFT, formats and sends it. */
 static Audio_Spectrum spectrum;
-static Spec_Stage spec_stage;
-static uint8_t spec_ch;
+static volatile uint8_t spec_collecting;
+static volatile uint8_t spec_ch;
 static uint8_t spec_line[UART_TX_BUF_SIZE];
 static size_t spec_len;
-static uint32_t spec_bin;
 static Audio_Clip clip = { audio_clip, AUDIO_CLIP_LEN, 0, 0, 2 };
 
 /* Record / play back both mics. Record: button from PC8 to GND, or the B1 user button
@@ -140,6 +148,10 @@ static Audio_Clip rec_clip[2];
 volatile uint8_t rec_split_test = 0;
 #define REC_SPLIT_FRAMES (REC_SECONDS * 48000U / 2U)
 static Audio_Button rec_button, play_button;
+/* Record / playback state, used only by the audio interrupt. */
+static uint32_t play_left;
+static uint32_t led_count;
+static uint32_t rec_frames;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -259,10 +271,8 @@ __attribute__((unused)) static void I2C_ConnectionTest(void)
   }
 }
 
-/* Restart SAI1 so the next received word is TDM slot 0 again. Both blocks stop at the
- * end of the current frame, their FIFOs are emptied, then the synchronous slave (B)
- * is enabled before the master (A). */
-static void Audio_Resync(void)
+/* Stop both SAI1 blocks at the end of the current frame and empty their FIFOs. */
+static void Audio_StopSai(void)
 {
   __HAL_SAI_DISABLE(&hsai_BlockB1);
   __HAL_SAI_DISABLE(&hsai_BlockA1);
@@ -274,13 +284,262 @@ static void Audio_Resync(void)
   SAI1_Block_B->CR2 |= SAI_xCR2_FFLUSH;
   __HAL_SAI_CLEAR_FLAG(&hsai_BlockA1, SAI_FLAG_OVRUDR);
   __HAL_SAI_CLEAR_FLAG(&hsai_BlockB1, SAI_FLAG_OVRUDR);
-  for (uint32_t i = 0; i < 4; i++)
+}
+
+/* Circular GPDMA channel with one linked-list node covering the whole buffer.
+ * The SAI HAL fills in the node's addresses and size when the transfer starts. */
+static HAL_StatusTypeDef Audio_DmaSetup(DMA_HandleTypeDef *hdma, DMA_Channel_TypeDef *channel,
+                                        DMA_NodeTypeDef *node, DMA_QListTypeDef *queue,
+                                        uint32_t request, uint32_t direction)
+{
+  DMA_NodeConfTypeDef conf = {0};
+  uint8_t to_periph = (direction == DMA_MEMORY_TO_PERIPH);
+
+  conf.NodeType = DMA_GPDMA_LINEAR_NODE;
+  conf.Init.Request = request;
+  conf.Init.BlkHWRequest = DMA_BREQ_SINGLE_BURST;
+  conf.Init.Direction = direction;
+  conf.Init.SrcInc = to_periph ? DMA_SINC_INCREMENTED : DMA_SINC_FIXED;
+  conf.Init.DestInc = to_periph ? DMA_DINC_FIXED : DMA_DINC_INCREMENTED;
+  conf.Init.SrcDataWidth = DMA_SRC_DATAWIDTH_WORD;
+  conf.Init.DestDataWidth = DMA_DEST_DATAWIDTH_WORD;
+  conf.Init.SrcBurstLength = 1;
+  conf.Init.DestBurstLength = 1;
+  conf.Init.TransferAllocatedPort = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT1;
+  conf.Init.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  conf.Init.Mode = DMA_NORMAL;
+  conf.TriggerConfig.TriggerPolarity = DMA_TRIG_POLARITY_MASKED;
+  conf.DataHandlingConfig.DataExchange = DMA_EXCHANGE_NONE;
+  conf.DataHandlingConfig.DataAlignment = DMA_DATA_RIGHTALIGN_ZEROPADDED;
+  if (HAL_DMAEx_List_BuildNode(&conf, node) != HAL_OK
+      || HAL_DMAEx_List_InsertNode(queue, NULL, node) != HAL_OK
+      || HAL_DMAEx_List_SetCircularMode(queue) != HAL_OK)
   {
-    SAI1_Block_B->DR = 0;
+    return HAL_ERROR;
   }
-  __HAL_SAI_ENABLE(&hsai_BlockB1);
-  __HAL_SAI_ENABLE(&hsai_BlockA1);
-  audio_resyncs++;
+
+  hdma->Instance = channel;
+  hdma->InitLinkedList.Priority = DMA_HIGH_PRIORITY;
+  hdma->InitLinkedList.LinkStepMode = DMA_LSM_FULL_EXECUTION;
+  hdma->InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT0;
+  hdma->InitLinkedList.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+  hdma->InitLinkedList.LinkedListMode = DMA_LINKEDLIST_CIRCULAR;
+  if (HAL_DMAEx_List_Init(hdma) != HAL_OK
+      || HAL_DMAEx_List_LinkQ(hdma, queue) != HAL_OK
+      || HAL_DMA_ConfigChannelAttributes(hdma, DMA_CHANNEL_NPRIV) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  return HAL_OK;
+}
+
+/* Start full-duplex audio on SAI1 DMA: Block A receives slots 0 and 1 (the mics),
+ * Block B sends slots 0 and 1 (the speakers). The synchronous slave (B) starts before
+ * the master (A), so the first word of each buffer is TDM slot 0. */
+static HAL_StatusTypeDef Audio_Start(void)
+{
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+  if (Audio_DmaSetup(&hdma_sai1_a, GPDMA1_Channel1, &dma_node_sai1_a, &dma_queue_sai1_a,
+                     GPDMA1_REQUEST_SAI1_A, DMA_PERIPH_TO_MEMORY) != HAL_OK
+      || Audio_DmaSetup(&hdma_sai1_b, GPDMA1_Channel2, &dma_node_sai1_b, &dma_queue_sai1_b,
+                        GPDMA1_REQUEST_SAI1_B, DMA_MEMORY_TO_PERIPH) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  __HAL_LINKDMA(&hsai_BlockA1, hdmarx, hdma_sai1_a);
+  __HAL_LINKDMA(&hsai_BlockB1, hdmatx, hdma_sai1_b);
+
+  /* Above the UART (14) so audio is never held up by it. */
+  HAL_NVIC_SetPriority(GPDMA1_Channel1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(GPDMA1_Channel1_IRQn);
+  HAL_NVIC_SetPriority(GPDMA1_Channel2_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(GPDMA1_Channel2_IRQn);
+
+  /* Block A was running only to supply MCLK during codec setup. */
+  Audio_StopSai();
+  if (HAL_SAI_Transmit_DMA(&hsai_BlockB1, (uint8_t *)audio_tx_buf, AUDIO_BUF_WORDS) != HAL_OK
+      || HAL_SAI_Receive_DMA(&hsai_BlockA1, (uint8_t *)audio_rx_buf, AUDIO_BUF_WORDS) != HAL_OK)
+  {
+    return HAL_ERROR;
+  }
+  return HAL_OK;
+}
+
+/* Process one 1 ms block: rx holds AUDIO_BLOCK_FRAMES frames of mic samples (slot 0,
+ * slot 1), tx receives the matching speaker samples. Runs in the DMA interrupt. While
+ * this block of rx was being received, the DMA was playing the other half of tx, so
+ * this tx half is played about 1 ms from now. */
+static void Audio_ProcessBlock(const uint32_t *rx, uint32_t *tx)
+{
+  uint32_t t_start = DWT->CYCCNT;
+
+  for (uint32_t f = 0; f < AUDIO_BLOCK_FRAMES; f++)
+  {
+    int32_t mic[2];
+    for (uint32_t ch = 0; ch < 2; ch++)
+    {
+      mic[ch] = Audio_FromSai24(rx[2 * f + ch]);
+      Audio_MeterAdd((Audio_Meter *)&mic_meter[ch], mic[ch]);
+      int32_t dev = mic[ch] - mic_meter[ch].dc;
+      uint32_t mag = (dev < 0) ? (uint32_t)(-(int64_t)dev) : (uint32_t)dev;
+      if (mag > stream_peak[ch])
+      {
+        stream_peak[ch] = mag;
+      }
+    }
+
+    uint8_t rec_raw = (HAL_GPIO_ReadPin(REC_BTN_PORT, REC_BTN_PIN) == GPIO_PIN_RESET)
+                      || (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET);
+    if (Audio_ButtonPressed(&rec_button, rec_raw))
+    {
+      Audio_RecStart(&recorder[0]);
+      Audio_RecStart(&recorder[1]);
+      app_state = APP_RECORDING;
+      led_count = 0;
+      rec_frames = 0;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+    }
+    if (Audio_ButtonPressed(&play_button, HAL_GPIO_ReadPin(PLAY_BTN_PORT, PLAY_BTN_PIN) == GPIO_PIN_RESET)
+        && app_state != APP_RECORDING && recorder[0].len > 0)
+    {
+      for (uint32_t ch = 0; ch < 2; ch++)
+      {
+        /* In the split test both outputs play the single track in rec_buf[0]. */
+        uint32_t src = rec_split_test ? 0U : ch;
+        rec_clip[ch] = (Audio_Clip){ rec_buf[src], recorder[src].len, 0, 0, REC_RATIO };
+      }
+      play_left = recorder[0].len * REC_RATIO;
+      app_state = APP_PLAYING;
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
+    }
+
+    int32_t out[2] = { 0, 0 };
+    if (app_state == APP_RECORDING)
+    {
+      uint8_t second_half = (rec_split_test && rec_frames >= REC_SPLIT_FRAMES) ? 1U : 0U;
+      if (rec_frames == REC_SPLIT_FRAMES && rec_split_test)
+      {
+        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
+        led_count = 0;
+      }
+      rec_frames++;
+      if (++led_count == LED_FLASH_FRAMES)
+      {
+        led_count = 0;
+        if (second_half)
+        {
+          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
+        }
+        else
+        {
+          HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_2);
+        }
+      }
+      uint8_t full;
+      if (rec_split_test)
+      {
+        full = Audio_RecAdd(&recorder[0], second_half ? mic[1] : mic[0]);
+      }
+      else
+      {
+        full = Audio_RecAdd(&recorder[0], mic[0]);
+        full |= Audio_RecAdd(&recorder[1], mic[1]);
+      }
+      if (full)
+      {
+        app_state = APP_IDLE;
+        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
+      }
+    }
+    else if (app_state == APP_PLAYING)
+    {
+      out[0] = Audio_ClipNext(&rec_clip[0]);
+      out[1] = Audio_ClipNext(&rec_clip[1]);
+      if (--play_left == 0U)
+      {
+        app_state = APP_IDLE;
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
+      }
+    }
+    else if (audio_mode == 0)
+    {
+      out[0] = Audio_ClipNext(&clip);
+      out[1] = out[0];
+    }
+    else if (audio_mode == 1)
+    {
+      out[0] = mic[0];
+      out[1] = mic[1];
+    }
+    else if (audio_mode == 3)
+    {
+      out[0] = Audio_ToneNext(&tone);
+      out[1] = out[0];
+    }
+    tx[2 * f] = Audio_ToSai24(out[0]);
+    tx[2 * f + 1] = Audio_ToSai24(out[1]);
+
+    /* Streams: hand data to the main loop, which does the slow work. */
+    if (++stream_frames >= MIC_STREAM_FRAMES)
+    {
+      mic_report[0] = stream_peak[0];
+      mic_report[1] = stream_peak[1];
+      mic_report_ready = 1;
+      stream_peak[0] = 0;
+      stream_peak[1] = 0;
+      stream_frames = 0;
+    }
+    if (spec_collecting && Audio_SpectrumAdd(&spectrum, mic[spec_ch]))
+    {
+      spec_collecting = 0;
+    }
+  }
+
+  if (SAI1_Block_B->SR & SAI_xSR_OVRUDR)
+  {
+    audio_tx_underruns++;
+    __HAL_SAI_CLEAR_FLAG(&hsai_BlockB1, SAI_FLAG_OVRUDR);
+  }
+  audio_frames += AUDIO_BLOCK_FRAMES;
+  audio_blocks++;
+  uint32_t cycles = DWT->CYCCNT - t_start;
+  if (cycles > audio_isr_max_cycles)
+  {
+    audio_isr_max_cycles = cycles;
+  }
+}
+
+void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *hsai)
+{
+  if (hsai == &hsai_BlockA1)
+  {
+    Audio_ProcessBlock(&audio_rx_buf[0], &audio_tx_buf[0]);
+  }
+}
+
+void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *hsai)
+{
+  if (hsai == &hsai_BlockA1)
+  {
+    Audio_ProcessBlock(&audio_rx_buf[AUDIO_BUF_WORDS / 2U], &audio_tx_buf[AUDIO_BUF_WORDS / 2U]);
+  }
+}
+
+void HAL_SAI_ErrorCallback(SAI_HandleTypeDef *hsai)
+{
+  (void)hsai;
+  audio_sai_errors++;
+}
+
+void GPDMA1_Channel1_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai1_a);
+}
+
+void GPDMA1_Channel2_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_sai1_b);
 }
 /* USER CODE END 0 */
 
@@ -356,17 +615,12 @@ int main(void)
   Audio_ToneSet(&tone, TONE_HZ, 48000.0f, TONE_LEVEL);
   Audio_SpectrumStart(&spectrum);
 
-  /* Cycle counter for the audio loop timing measurements. */
+  /* Cycle counter for the audio interrupt timing measurement. */
   DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  /* Start full-duplex audio: Block A receives slots 0 and 1, Block B sends slots 0 and 1. */
-  Audio_Resync();
   uint8_t last_vol = 0xFF;
-  uint32_t play_left = 0;
-  uint32_t led_count = 0;
-  uint32_t rec_frames = 0;
 
   /* Buttons and LEDs. */
   {
@@ -394,6 +648,13 @@ int main(void)
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
   }
 
+  /* Start the spectrum stream's first collection, then audio. */
+  spec_collecting = (stream_mode == 2);
+  if (Audio_Start() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -403,8 +664,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uint32_t t_top = DWT->CYCCNT;
-    uint32_t t_wait = 0;          /* cycles spent waiting on the SAI, not working */
+    /* Audio runs in the SAI DMA interrupt; this loop does the slow work, and nothing
+     * here can make the audio late. */
     uart_comm_poll();
 
     /* DAC volume: -12 dB for mic passthrough to keep feedback down, 0 dB otherwise.
@@ -418,208 +679,59 @@ int main(void)
       ADAU1372_SetDacVolume(&codec, 1, vol);
     }
 
-    /* A stall long enough to overflow the receive FIFO can leave the slots out of
-     * order, so restart the SAI whenever that happens (including after the I2C above). */
-    if (SAI1_Block_A->SR & SAI_xSR_OVRUDR)
+    if (mic_report_ready)
     {
-      Audio_Resync();
-    }
-
-    uint8_t rec_raw = (HAL_GPIO_ReadPin(REC_BTN_PORT, REC_BTN_PIN) == GPIO_PIN_RESET)
-                      || (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET);
-    if (Audio_ButtonPressed(&rec_button, rec_raw))
-    {
-      Audio_RecStart(&recorder[0]);
-      Audio_RecStart(&recorder[1]);
-      app_state = APP_RECORDING;
-      led_count = 0;
-      rec_frames = 0;
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
-    }
-    if (Audio_ButtonPressed(&play_button, HAL_GPIO_ReadPin(PLAY_BTN_PORT, PLAY_BTN_PIN) == GPIO_PIN_RESET)
-        && app_state != APP_RECORDING && recorder[0].len > 0)
-    {
-      for (uint32_t ch = 0; ch < 2; ch++)
+      mic_report_ready = 0;
+      if (stream_mode == 1)
       {
-        /* In the split test both outputs play the single track in rec_buf[0]. */
-        uint32_t src = rec_split_test ? 0U : ch;
-        rec_clip[ch] = (Audio_Clip){ rec_buf[src], recorder[src].len, 0, 0, REC_RATIO };
-      }
-      play_left = recorder[0].len * REC_RATIO;
-      app_state = APP_PLAYING;
-      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_SET);
-    }
-
-    /* Two mic samples arrive per 48 kHz frame (slot 0, slot 1); waiting for them paces the loop. */
-    int32_t mic[2];
-    for (uint32_t ch = 0; ch < 2; ch++)
-    {
-      uint32_t t0 = DWT->CYCCNT;
-      while ((SAI1_Block_A->SR & SAI_xSR_FLVL) == SAI_FIFOSTATUS_EMPTY)
-      {
-      }
-      t_wait += DWT->CYCCNT - t0;
-      mic[ch] = Audio_FromSai24(SAI1_Block_A->DR);
-      Audio_MeterAdd((Audio_Meter *)&mic_meter[ch], mic[ch]);
-      int32_t dev = mic[ch] - mic_meter[ch].dc;
-      uint32_t mag = (dev < 0) ? (uint32_t)(-(int64_t)dev) : (uint32_t)dev;
-      if (mag > stream_peak[ch])
-      {
-        stream_peak[ch] = mag;
+        /* If UART is still busy this report is skipped, never waited for. */
+        uint8_t msg[32];
+        size_t n = 4;
+        memcpy(msg, "MIC,", 4);
+        n += uart_format_uint(&msg[n], mic_report[0]);
+        msg[n++] = ',';
+        n += uart_format_uint(&msg[n], mic_report[1]);
+        msg[n++] = '\r';
+        msg[n++] = '\n';
+        uart_send(msg, n);
       }
     }
 
-    int32_t out[2] = { 0, 0 };
-    if (app_state == APP_RECORDING)
+    if (stream_mode == 2 && !spec_collecting && spectrum.phase == 0U)
     {
-      uint8_t second_half = (rec_split_test && rec_frames >= REC_SPLIT_FRAMES) ? 1U : 0U;
-      if (rec_frames == REC_SPLIT_FRAMES && rec_split_test)
+      /* Stream just switched on: start collecting. */
+      Audio_SpectrumStart(&spectrum);
+      __DMB();
+      spec_collecting = 1;
+    }
+    else if (stream_mode == 2 && !spec_collecting)
+    {
+      /* The interrupt has collected a full set of samples: run the FFT, format the
+       * line, and send it once the UART is free. */
+      if (spec_len == 0U)
       {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
-        led_count = 0;
-      }
-      rec_frames++;
-      if (++led_count == LED_FLASH_FRAMES)
-      {
-        led_count = 0;
-        if (second_half)
+        while (!Audio_SpectrumStep(&spectrum))
         {
-          HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
         }
-        else
+        memcpy(spec_line, "FFT,", 4);
+        spec_len = 4;
+        spec_line[spec_len++] = (uint8_t)('0' + spec_ch);
+        for (uint32_t k = 0; k < SPEC_BINS; k++)
         {
-          HAL_GPIO_TogglePin(GPIOG, GPIO_PIN_2);
+          spec_line[spec_len++] = ',';
+          spec_len += uart_format_uint(&spec_line[spec_len], spectrum.db[k]);
         }
+        spec_line[spec_len++] = '\r';
+        spec_line[spec_len++] = '\n';
       }
-      uint8_t full;
-      if (rec_split_test)
+      if (!uart_tx_busy() && uart_send(spec_line, spec_len))
       {
-        full = Audio_RecAdd(&recorder[0], second_half ? mic[1] : mic[0]);
+        spec_len = 0;
+        spec_ch ^= 1U;
+        Audio_SpectrumStart(&spectrum);
+        __DMB();                 /* spectrum reset before the interrupt starts adding */
+        spec_collecting = 1;
       }
-      else
-      {
-        full = Audio_RecAdd(&recorder[0], mic[0]);
-        full |= Audio_RecAdd(&recorder[1], mic[1]);
-      }
-      if (full)
-      {
-        app_state = APP_IDLE;
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_2, GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
-      }
-    }
-    else if (app_state == APP_PLAYING)
-    {
-      out[0] = Audio_ClipNext(&rec_clip[0]);
-      out[1] = Audio_ClipNext(&rec_clip[1]);
-      if (--play_left == 0U)
-      {
-        app_state = APP_IDLE;
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7, GPIO_PIN_RESET);
-      }
-    }
-    else if (audio_mode == 0)
-    {
-      out[0] = Audio_ClipNext(&clip);
-      out[1] = out[0];
-    }
-    else if (audio_mode == 1)
-    {
-      out[0] = mic[0];
-      out[1] = mic[1];
-    }
-    else if (audio_mode == 3)
-    {
-      out[0] = Audio_ToneNext(&tone);
-      out[1] = out[0];
-    }
-
-    /* Two words per frame (left, right); wait until the FIFO has room for both. */
-    uint32_t t1 = DWT->CYCCNT;
-    while ((SAI1_Block_B->SR & SAI_xSR_FLVL) >= SAI_FIFOSTATUS_3QUARTERFULL)
-    {
-    }
-    t_wait += DWT->CYCCNT - t1;
-    SAI1_Block_B->DR = Audio_ToSai24(out[0]);
-    SAI1_Block_B->DR = Audio_ToSai24(out[1]);
-    if (SAI1_Block_B->SR & SAI_xSR_OVRUDR)
-    {
-      audio_tx_underruns++;
-      __HAL_SAI_CLEAR_FLAG(&hsai_BlockB1, SAI_FLAG_OVRUDR);
-    }
-    audio_frames++;
-
-    if (stream_mode == 1 && ++stream_frames >= MIC_STREAM_FRAMES)
-    {
-      /* If UART is still busy this report is skipped, never waited for. */
-      uint8_t msg[32];
-      size_t n = 4;
-      memcpy(msg, "MIC,", 4);
-      n += uart_format_uint(&msg[n], stream_peak[0]);
-      msg[n++] = ',';
-      n += uart_format_uint(&msg[n], stream_peak[1]);
-      msg[n++] = '\r';
-      msg[n++] = '\n';
-      uart_send(msg, n);
-      stream_peak[0] = 0;
-      stream_peak[1] = 0;
-      stream_frames = 0;
-    }
-
-    if (stream_mode == 2)
-    {
-      /* One stage step per frame keeps each frame's extra work to a few microseconds. */
-      switch (spec_stage)
-      {
-        case SPEC_COLLECT:
-          if (Audio_SpectrumAdd(&spectrum, mic[spec_ch]))
-          {
-            spec_stage = SPEC_PROCESS;
-          }
-          break;
-        case SPEC_PROCESS:
-          if (Audio_SpectrumStep(&spectrum))
-          {
-            memcpy(spec_line, "FFT,", 4);
-            spec_len = 4;
-            spec_line[spec_len++] = (uint8_t)('0' + spec_ch);
-            spec_bin = 0;
-            spec_stage = SPEC_FORMAT;
-          }
-          break;
-        case SPEC_FORMAT:
-          for (uint32_t i = 0; i < SPEC_FORMAT_PER_FRAME && spec_bin < SPEC_BINS; i++, spec_bin++)
-          {
-            spec_line[spec_len++] = ',';
-            spec_len += uart_format_uint(&spec_line[spec_len], spectrum.db[spec_bin]);
-          }
-          if (spec_bin == SPEC_BINS)
-          {
-            spec_line[spec_len++] = '\r';
-            spec_line[spec_len++] = '\n';
-            spec_stage = SPEC_SEND;
-          }
-          break;
-        case SPEC_SEND:
-          /* Waits (without blocking) until the previous line has finished sending. */
-          if (!uart_tx_busy() && uart_send(spec_line, spec_len))
-          {
-            spec_ch ^= 1U;
-            Audio_SpectrumStart(&spectrum);
-            spec_stage = SPEC_COLLECT;
-          }
-          break;
-      }
-    }
-
-    uint32_t work = (DWT->CYCCNT - t_top) - t_wait;
-    if (work > audio_work_max_cycles)
-    {
-      audio_work_max_cycles = work;
-    }
-    if (work > FRAME_CYCLES)
-    {
-      audio_late_frames++;
     }
   }
   /* USER CODE END 3 */
